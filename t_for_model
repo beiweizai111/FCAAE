@@ -1,0 +1,279 @@
+import numpy as np
+
+from collections import OrderedDict
+import torch.nn.functional as F
+from NormalizedAttention import *
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+import h5py
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+import torch.nn as nn
+sum_channel = 0
+
+'''class ConvBlockShortCut(nn.Module):
+	def __init__(self, in_channels=64, out_channels=64):
+		super(ConvBlockShortCut, self).__init__()
+		self.in_channels = in_channels
+		self.out_channels = out_channels
+		self.conv1 = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=5, padding=2)
+		self.conv2 = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=3, padding=1)
+		self.conv3 = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=1)
+		self.bn1 = nn.BatchNorm1d(out_channels)
+		self.bn2 = nn.BatchNorm1d(out_channels)
+		self.bn3 = nn.BatchNorm1d(out_channels)
+
+	def forward(self, x):
+		x1 = self.conv1(x)
+		x1 = self.bn1(x1)
+
+		x2 = self.conv2(x)
+		x2 = self.bn2(x2)
+
+		x3 = self.conv3(x)
+		x3 = self.bn3(x3)
+
+		if self.in_channels == self.out_channels:
+			x = x1 + x2 + x3 + x
+		else:
+			x = x1 + x2 + x3
+		x = F.relu(x)
+		return x'''
+
+
+class FCAAE(nn.Module):
+    # Fully Convolutional AutoEncoder model for fMRI time series modeling with bottleneck architechture
+    def __init__(self, n_input_channels=[1, 128, 64, 32], n_output_channels=[128, 64, 32, 1], stride=2, kernel_size=31,
+                 padding=15, l2_lambda=0.01):
+        super(FCAAE, self).__init__()
+        self.l2_lambda = l2_lambda  # L2正则化系数
+
+        # 注意力模块
+        self.sa1 = TimeAttention(in_channels=128)
+        self.sa2 = TimeAttention(in_channels=64)
+        self.sa3 = TimeAttention(in_channels=32)
+        self.ca1 = ChannelAttention(in_channels=128)
+        self.ca2 = ChannelAttention(in_channels=64)
+        self.ca3 = ChannelAttention(in_channels=32)
+
+        # 编码器部分
+        encoder_list = []
+        for i, (in_channel, out_channel) in enumerate(zip(n_input_channels, n_output_channels)):
+            encoder_list.append(('enc_conv{}'.format(i),
+                                 nn.Conv1d(in_channels=in_channel, out_channels=out_channel, kernel_size=kernel_size,
+                                           stride=stride, padding=padding)))
+            encoder_list.append(('enc_bn{}'.format(i), nn.BatchNorm1d(out_channel)))
+            encoder_list.append(('enc_relu{}'.format(i), nn.ReLU()))
+        self.encoder = nn.Sequential(OrderedDict(encoder_list))
+
+        self.encoder1 = nn.Sequential(
+            nn.Conv1d(in_channels=1, out_channels=128, kernel_size=kernel_size, stride=stride, padding=padding),
+            nn.BatchNorm1d(128),
+            nn.ReLU()
+        )
+
+        self.encoder2 = nn.Sequential(
+            nn.Conv1d(in_channels=128, out_channels=64, kernel_size=kernel_size, stride=stride, padding=padding),
+            nn.BatchNorm1d(64),
+            nn.ReLU()
+        )
+        self.lstm1 = nn.LSTM(input_size=64, hidden_size=64, num_layers=1, batch_first=True)
+
+        self.encoder3 = nn.Sequential(
+            nn.Conv1d(in_channels=64, out_channels=32, kernel_size=kernel_size, stride=stride, padding=padding),
+            nn.BatchNorm1d(32),
+            nn.ReLU()
+        )
+        self.lstm2 = nn.LSTM(input_size=32, hidden_size=32, num_layers=1, batch_first=True)
+
+        self.encoder4 = nn.Sequential(
+            nn.Conv1d(in_channels=32, out_channels=1, kernel_size=kernel_size, stride=stride, padding=padding),
+            nn.BatchNorm1d(1),
+            nn.ReLU()
+        )
+
+        # 解码器部分
+        decoder_list = []
+        for i, (in_channel, out_channel) in enumerate(zip(n_output_channels[::-1], n_input_channels[::-1])):
+            decoder_list.append(('dec_conv{}'.format(i),
+                                 nn.ConvTranspose1d(in_channels=in_channel, out_channels=out_channel,
+                                                    kernel_size=kernel_size, stride=stride, padding=padding,
+                                                    output_padding=1)))
+            decoder_list.append(('dec_bn{}'.format(i), nn.BatchNorm1d(out_channel)))
+            if i != len(n_output_channels):
+                decoder_list.append(('dec_relu{}'.format(i), nn.ReLU()))
+        decoder_list.append(('dec_out', nn.Conv1d(1, 1, 3, 1, 1)))
+        self.decoder = nn.Sequential(OrderedDict(decoder_list))
+
+    def _apply_l2_regularization(self, x, original_x):
+        # 第一个分支：注意力结果与原始结果相乘后L2正则化
+        att_branch = torch.sigmoid(x) * original_x
+        l2_att = self.l2_lambda * torch.norm(att_branch, p=2)
+
+        # 第二个分支：原始结果L2正则化
+        l2_original = self.l2_lambda * torch.norm(original_x, p=2)
+
+        # 返回两个分支的和
+        return l2_att + l2_original
+
+    def forward(self, x):
+        l2_total = 0  # 用于累积所有L2正则化项
+
+        # 第一层
+        x1 = self.encoder1(x)
+        x1_sa = self.sa1(x1)
+        x1_ca = self.ca1(x1_sa)
+        x1, l2 = self._apply_l2_regularization(x1_ca, x1)
+        l2_total += l2
+
+        # 第二层
+        x2 = self.encoder2(x1)
+        x2_sa = self.sa2(x2)
+        x2_ca = self.ca2(x2_sa)
+        x2, l2 = self._apply_l2_regularization(x2_ca, x2)
+        l2_total += l2
+
+        x2 = x2.permute(0, 2, 1)
+        x2, _ = self.lstm1(x2)
+        x2 = x2.permute(0, 2, 1)
+
+        # 第三层
+        x3 = self.encoder3(x2)
+        x3_sa = self.sa3(x3)
+        x3_ca = self.ca3(x3_sa)
+        x3, l2 = self._apply_l2_regularization(x3_ca, x3)
+        l2_total += l2
+
+        x3 = x3.permute(0, 2, 1)
+        x3, _ = self.lstm2(x3)
+        x3 = x3.permute(0, 2, 1)
+
+        # 第四层
+        x4 = self.encoder4(x3)
+
+        # 解码过程
+        x = self.decoder(x4)
+
+        # 返回输出和L2正则化项
+        return x, l2_total
+
+#加载数据
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+import h5py
+def find_largest_multiple_of_32(number):
+    # 找到比给定数字最大的32的倍数的数字，用于截断时间序列
+    return (number // 32) * 32
+NUM_VOXEL = 228453
+
+num_voxels = int(10 * np.floor(NUM_VOXEL * 0.1))  # 使得所有任务的时间序列个数相同，
+# 可以取50个被试用于train_dataloader,10个用于val_dataloader,，其余的数据暂时不用
+
+
+TASK_LIST = ['EMOTION', 'GAMBLING', 'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM']  # HCP 7种任务数据模态
+X_tensor = {}  # 用于存放train_data
+
+for task in TASK_LIST:
+    # 保存为h5py格式文件
+    f = h5py.File('D:/shiyan/data_train/data_for_train/{}_fmri_mat.h5'.format(task), 'r')
+    num_TR = find_largest_multiple_of_32(f['S'].shape[-1])
+    tmp_data = f['S'][:num_voxels, :, :num_TR]  # 取每个任务的前num_TR个时间序列，将时间序列长度截断为num_TR个（32的整数倍）
+    X_tensor[task] = torch.Tensor(tmp_data)
+    f.close()
+dataset = TensorDataset(*[X_tensor[task] for task in TASK_LIST])
+
+# 创建一个DataLoader
+batch_size = 256
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+# 计算模型的输入和输出的皮尔逊相关系数
+
+import numpy as np
+def compute_Pcc(x,y):
+    # x:2D，n*T,y :n*T,numpy ndarray
+    pcc = 0
+    for i in range(x.shape[0]):  # 对每个样本计算 PCC
+        rho = np.corrcoef(x[i], y[i])[1, 0]
+        if not np.isnan(rho):
+            pcc += rho
+    return pcc/x.shape[0]
+
+import torch.optim as optim
+num_epochs = 100
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(device)
+
+model = FCAAE()
+model.to(device)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.MSELoss()
+#j = 0
+
+global_step = 0  # 初始化全局步骤计数器
+writer = SummaryWriter('runs/experiment2')  # 'runs/experiment1'是日志文件保存的目录
+
+for epoch in range(num_epochs):
+    #print(f"这是{j}个迭代")
+    loss_all = 0
+    for batch_idx, data in enumerate(dataloader):
+
+        # data = data.to(device)
+        # Zero the gradients
+        optimizer.zero_grad()
+        # Forward pass
+        loss = 0
+        mse = 0
+        mse1 = 0
+        pcc = 0
+        pcc_avg = 0
+        for input in data:
+            input = torch.tensor(input)
+            # input = data
+            labels = input
+            # 将列表中的每个元素都转换为设备对象
+
+            input, labels = input.to(device), labels.to(device)
+            output = model(input)
+            mse += criterion(output, input)
+            #mse1 += criterion(encode1, encode)
+            loss = mse
+            input_cpu = input.squeeze().detach().cpu().numpy()
+            output_cpu = output.squeeze().detach().cpu().numpy()
+
+            # print(input_cpu.shape,output_cpu.shape)
+            pcc += compute_Pcc(input_cpu, output_cpu)
+            # print(compute_Pcc(input_cpu, output_cpu))
+        pcc_avg = pcc/len(data)
+
+
+        loss.backward()
+        optimizer.step()
+        # k +=1
+        print(f"Epoch [{epoch}/{num_epochs}], Loss: {loss.item():.4f},pcc_avg:{pcc_avg}")
+        writer.add_scalar('Loss/Total', loss.item(), global_step=global_step)  # 记录总损失
+        global_step += 1  # 更新全局步骤计数器
+
+        #loss_all+=loss
+        #loss_average=loss_all/len(dataloader)
+    #writer.add_scalar('Loss_epoch', loss_average.item(), epoch+1)  # 记录总损失
+    writer.add_scalar('Loss_epoch', loss.item(), epoch + 1)  # 记录总损失
+# 保存模型
+    model_filename = f"D:/shiyan/model_l2_gpu/model_epoch_{epoch}.pth"
+    torch.save(model.state_dict(), model_filename)
+    plt.figure()
+    #plt.plot(loss.cpu().numpy())
+    plt.plot(loss.detach().cpu().numpy())
+
+    #plt.plot(loss)
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    #j += 1
+
+writer.close()
+
+print("Training completed!")
