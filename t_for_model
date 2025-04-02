@@ -51,9 +51,9 @@ class FCAAE(nn.Module):
     def __init__(self, n_input_channels=[1, 128, 64, 32], n_output_channels=[128, 64, 32, 1], stride=2, kernel_size=31,
                  padding=15, l2_lambda=0.01):
         super(FCAAE, self).__init__()
-        self.l2_lambda = l2_lambda  # L2正则化系数
+        self.l2_lambda = l2_lambda 
 
-        # 注意力模块
+        
         self.sa1 = TimeAttention(in_channels=128)
         self.sa2 = TimeAttention(in_channels=64)
         self.sa3 = TimeAttention(in_channels=32)
@@ -61,7 +61,6 @@ class FCAAE(nn.Module):
         self.ca2 = ChannelAttention(in_channels=64)
         self.ca3 = ChannelAttention(in_channels=32)
 
-        # 编码器部分
         encoder_list = []
         for i, (in_channel, out_channel) in enumerate(zip(n_input_channels, n_output_channels)):
             encoder_list.append(('enc_conv{}'.format(i),
@@ -97,7 +96,7 @@ class FCAAE(nn.Module):
             nn.ReLU()
         )
 
-        # 解码器部分
+       
         decoder_list = []
         for i, (in_channel, out_channel) in enumerate(zip(n_output_channels[::-1], n_input_channels[::-1])):
             decoder_list.append(('dec_conv{}'.format(i),
@@ -111,27 +110,23 @@ class FCAAE(nn.Module):
         self.decoder = nn.Sequential(OrderedDict(decoder_list))
 
     def _apply_l2_regularization(self, x, original_x):
-        # 第一个分支：注意力结果与原始结果相乘后L2正则化
+       
         att_branch = torch.sigmoid(x) * original_x
         l2_att = self.l2_lambda * torch.norm(att_branch, p=2)
 
-        # 第二个分支：原始结果L2正则化
         l2_original = self.l2_lambda * torch.norm(original_x, p=2)
 
-        # 返回两个分支的和
         return l2_att + l2_original
 
     def forward(self, x):
-        l2_total = 0  # 用于累积所有L2正则化项
+        l2_total = 0 
 
-        # 第一层
         x1 = self.encoder1(x)
         x1_sa = self.sa1(x1)
         x1_ca = self.ca1(x1_sa)
         x1, l2 = self._apply_l2_regularization(x1_ca, x1)
         l2_total += l2
 
-        # 第二层
         x2 = self.encoder2(x1)
         x2_sa = self.sa2(x2)
         x2_ca = self.ca2(x2_sa)
@@ -142,7 +137,6 @@ class FCAAE(nn.Module):
         x2, _ = self.lstm1(x2)
         x2 = x2.permute(0, 2, 1)
 
-        # 第三层
         x3 = self.encoder3(x2)
         x3_sa = self.sa3(x3)
         x3_ca = self.ca3(x3_sa)
@@ -153,50 +147,41 @@ class FCAAE(nn.Module):
         x3, _ = self.lstm2(x3)
         x3 = x3.permute(0, 2, 1)
 
-        # 第四层
         x4 = self.encoder4(x3)
 
-        # 解码过程
         x = self.decoder(x4)
 
-        # 返回输出和L2正则化项
         return x, l2_total
 
-#加载数据
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 import h5py
 def find_largest_multiple_of_32(number):
-    # 找到比给定数字最大的32的倍数的数字，用于截断时间序列
     return (number // 32) * 32
 NUM_VOXEL = 228453
 
-num_voxels = int(10 * np.floor(NUM_VOXEL * 0.1))  # 使得所有任务的时间序列个数相同，
-# 可以取50个被试用于train_dataloader,10个用于val_dataloader,，其余的数据暂时不用
+num_voxels = int(10 * np.floor(NUM_VOXEL * 0.1))  
 
 
-TASK_LIST = ['EMOTION', 'GAMBLING', 'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM']  # HCP 7种任务数据模态
-X_tensor = {}  # 用于存放train_data
+TASK_LIST = ['EMOTION', 'GAMBLING', 'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM'] 
+X_tensor = {} 
 
 for task in TASK_LIST:
-    # 保存为h5py格式文件
     f = h5py.File('D:/shiyan/data_train/data_for_train/{}_fmri_mat.h5'.format(task), 'r')
     num_TR = find_largest_multiple_of_32(f['S'].shape[-1])
-    tmp_data = f['S'][:num_voxels, :, :num_TR]  # 取每个任务的前num_TR个时间序列，将时间序列长度截断为num_TR个（32的整数倍）
+    tmp_data = f['S'][:num_voxels, :, :num_TR]  
     X_tensor[task] = torch.Tensor(tmp_data)
     f.close()
 dataset = TensorDataset(*[X_tensor[task] for task in TASK_LIST])
 
-# 创建一个DataLoader
 batch_size = 256
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-# 计算模型的输入和输出的皮尔逊相关系数
 
 import numpy as np
 def compute_Pcc(x,y):
     # x:2D，n*T,y :n*T,numpy ndarray
     pcc = 0
-    for i in range(x.shape[0]):  # 对每个样本计算 PCC
+    for i in range(x.shape[0]):  
         rho = np.corrcoef(x[i], y[i])[1, 0]
         if not np.isnan(rho):
             pcc += rho
@@ -213,11 +198,10 @@ optimizer = optim.Adam(model.parameters(), lr=0.001)
 criterion = nn.MSELoss()
 #j = 0
 
-global_step = 0  # 初始化全局步骤计数器
-writer = SummaryWriter('runs/experiment2')  # 'runs/experiment1'是日志文件保存的目录
+global_step = 0 
+writer = SummaryWriter('runs/experiment2') 
 
 for epoch in range(num_epochs):
-    #print(f"这是{j}个迭代")
     loss_all = 0
     for batch_idx, data in enumerate(dataloader):
 
@@ -234,8 +218,7 @@ for epoch in range(num_epochs):
             input = torch.tensor(input)
             # input = data
             labels = input
-            # 将列表中的每个元素都转换为设备对象
-
+        
             input, labels = input.to(device), labels.to(device)
             output = model(input)
             mse += criterion(output, input)
@@ -254,14 +237,12 @@ for epoch in range(num_epochs):
         optimizer.step()
         # k +=1
         print(f"Epoch [{epoch}/{num_epochs}], Loss: {loss.item():.4f},pcc_avg:{pcc_avg}")
-        writer.add_scalar('Loss/Total', loss.item(), global_step=global_step)  # 记录总损失
-        global_step += 1  # 更新全局步骤计数器
-
+        writer.add_scalar('Loss/Total', loss.item(), global_step=global_step) 
+        global_step += 1 
         #loss_all+=loss
         #loss_average=loss_all/len(dataloader)
-    #writer.add_scalar('Loss_epoch', loss_average.item(), epoch+1)  # 记录总损失
-    writer.add_scalar('Loss_epoch', loss.item(), epoch + 1)  # 记录总损失
-# 保存模型
+    #writer.add_scalar('Loss_epoch', loss_average.item(), epoch+1) 
+    writer.add_scalar('Loss_epoch', loss.item(), epoch + 1) 
     model_filename = f"D:/shiyan/model_l2_gpu/model_epoch_{epoch}.pth"
     torch.save(model.state_dict(), model_filename)
     plt.figure()
